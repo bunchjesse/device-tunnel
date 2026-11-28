@@ -21,11 +21,22 @@ import Synchronization
 /// right away, every ``directProbeInterval``, and whenever the network,
 /// routes, or the host's record change — and the first direct tunnel the
 /// host approves takes its place on the same listener.
+///
+/// A link dials only a host this device's user trusts (``TrustedHosts``);
+/// until then it stops in ``State/untrustedHost(hostName:fingerprint:)``.
+///
+/// Every process on this device can connect to the loopback port, and
+/// reaches the host as this device. Send the host's token with every
+/// request, and don't hand the port to code you don't trust.
 public actor RemoteHostLink {
     /// Where the link stands.
     public enum State: Sendable, Equatable {
         /// Trying to reach the host.
         case connecting
+        /// This device's user hasn't trusted the host, or distrusted it.
+        /// The link stops; once the user compares `fingerprint` with the
+        /// one the host shows and trusts it, call ``reconnect()``.
+        case untrustedHost(hostName: String, fingerprint: String)
         /// The host's user hasn't approved this device yet.
         case awaitingApproval(hostName: String)
         /// The host's API is reachable at `127.0.0.1:port` with `token`,
@@ -61,11 +72,16 @@ public actor RemoteHostLink {
     static let directProbeInterval: Duration = .seconds(30)
     /// How long one dial, every route raced, may take to produce a tunnel.
     static let dialTimeout: Duration = .seconds(20)
+    /// What ``State/unavailable(reason:)`` says when the two devices'
+    /// versions can't talk to each other.
+    static let updateBothDevices = "Update the app on both devices to connect."
 
     /// The host's endpoint ID.
     public nonisolated let hostEndpointID: String
 
     private let transport: any TunnelTransport
+    /// The hosts this device's user trusts.
+    private let trustedHosts: TrustedHosts
     /// The host's latest registry record, written without waiting for the
     /// actor so that the most recent ``update(host:)`` always wins.
     private let latestHost: Mutex<DeviceRecord>
@@ -120,14 +136,26 @@ public actor RemoteHostLink {
         }
     }
 
-    /// Creates a link to `host` over `node`. Call ``start()`` to begin
+    /// Creates a link to `host` over `node`, which connects only while
+    /// `trustedHosts` trusts the host. Call ``start()`` to begin
     /// connecting; `onStateChange` receives every state transition.
-    public init(node: RemoteNode, host: DeviceRecord, onStateChange: @escaping @Sendable (State) async -> Void) {
-        self.init(transport: node, host: host, onStateChange: onStateChange)
+    public init(
+        node: RemoteNode,
+        host: DeviceRecord,
+        trustedHosts: TrustedHosts,
+        onStateChange: @escaping @Sendable (State) async -> Void
+    ) {
+        self.init(transport: node, host: host, trustedHosts: trustedHosts, onStateChange: onStateChange)
     }
 
-    init(transport: any TunnelTransport, host: DeviceRecord, onStateChange: @escaping @Sendable (State) async -> Void) {
+    init(
+        transport: any TunnelTransport,
+        host: DeviceRecord,
+        trustedHosts: TrustedHosts,
+        onStateChange: @escaping @Sendable (State) async -> Void
+    ) {
         self.transport = transport
+        self.trustedHosts = trustedHosts
         self.latestHost = Mutex(host)
         self.hostEndpointID = host.endpointID
         self.dialedRoutes = Routes(host)
@@ -281,6 +309,18 @@ public actor RemoteHostLink {
     /// generation, so every `await` on this path must be followed by that check.
     private func attempt(backoff: Duration, generation: Int) async -> Outcome {
         let host = latestHost.withLock { $0 }
+        let trusted: Bool
+        do {
+            trusted = try isTrusted(host)
+        } catch {
+            RemoteLog.link.error("Keychain read failed while checking trust in \(host.name, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            await setState(.unavailable(reason: "This device couldn't read which hosts it trusts."), generation: generation)
+            return .retry(after: backoff, resetBackoff: false)
+        }
+        guard trusted else {
+            await setState(.untrustedHost(hostName: host.name, fingerprint: host.fingerprint), generation: generation)
+            return .stop
+        }
         dialedRoutes = Routes(host)
         isDialing = true
         await setState(.connecting, generation: generation)
@@ -331,7 +371,7 @@ public actor RemoteHostLink {
             return .retry(after: Self.notRecognizedRetry, resetBackoff: true)
         case .unsupportedProtocol:
             connection.close(reason: "unsupported protocol")
-            await setState(.unavailable(reason: "Update the app on both devices to connect."), generation: generation)
+            await setState(.unavailable(reason: Self.updateBothDevices), generation: generation)
             return .stop
         case .unavailable(let reason):
             connection.close(reason: "unavailable")
@@ -444,6 +484,7 @@ public actor RemoteHostLink {
     /// one in use. Returns whether it did.
     private func probeDirectRoute(replacing relayedID: UUID, generation: Int) async -> Bool {
         let host = latestHost.withLock { $0 }
+        guard (try? isTrusted(host)) == true else { return false }
         dialedRoutes = Routes(host)
         let transport = transport
         let direct: any TunnelConnection
@@ -529,11 +570,19 @@ public actor RemoteHostLink {
             return .retry(after: Self.notRecognizedRetry, resetBackoff: true)
         case .localNetworkDenied?:
             await setState(.localNetworkDenied, generation: generation)
+        case .outdatedPeer?:
+            await setState(.unavailable(reason: Self.updateBothDevices), generation: generation)
         default:
             RemoteLog.link.info("Couldn't reach \(self.hostName, privacy: .public): \(error.localizedDescription, privacy: .public)")
             await setState(.unreachable(reason: error.localizedDescription), generation: generation)
         }
         return .retry(after: backoff, resetBackoff: false)
+    }
+
+    /// Whether this device's user trusts `host`. Throws when the Keychain
+    /// can't say, which callers treat as not trusted.
+    private func isTrusted(_ host: DeviceRecord) throws -> Bool {
+        try trustedHosts.decision(for: host.endpointID) == .approved
     }
 
     /// Says hello on a new tunnel and returns the host's answer. With
@@ -565,6 +614,7 @@ public actor RemoteHostLink {
     private var stateLabel: String {
         switch state {
         case .connecting: "connecting"
+        case .untrustedHost: "untrustedHost"
         case .awaitingApproval: "awaitingApproval"
         case .connected(let port, _, let path): "connected(port: \(port), \(path))"
         case .denied: "denied"

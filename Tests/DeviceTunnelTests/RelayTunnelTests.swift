@@ -201,13 +201,16 @@ struct RelayAddressTests {
         #expect(RemoteNode.canonicalRelayAddress("") == nil)
     }
 
-    /// A record without a `relayAddress` key decodes with no relay, and a
-    /// record's relay survives the round trip through the registry's JSON.
+    /// A record without a `relayAddress` key decodes with no relay, one
+    /// from protocol 2 decodes without a gate key, and a record's relay
+    /// survives the round trip through the registry's JSON.
     @Test func recordsDecodeWithAndWithoutARelay() throws {
         let withoutRelay = Data("""
         {"endpointID":"ab","name":"Studio","platform":"macOS","canHost":true,"directAddresses":[],"protocolVersion":2,"updatedAt":0}
         """.utf8)
-        #expect(try JSONDecoder().decode(DeviceRecord.self, from: withoutRelay).relayAddress == nil)
+        let decodedOld = try JSONDecoder().decode(DeviceRecord.self, from: withoutRelay)
+        #expect(decodedOld.relayAddress == nil)
+        #expect(decodedOld.gateKey == nil)
 
         let record = makeRecord(endpointID: "ab", canHost: true, relayAddress: "relay.example.com:3340")
         let decoded = try JSONDecoder().decode(DeviceRecord.self, from: JSONEncoder().encode(record))

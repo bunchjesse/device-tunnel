@@ -1,12 +1,13 @@
 import Foundation
 
-/// A host's decision about one device.
+/// A device's decision about another device: a host's about a client, or a
+/// client's about a host (``TrustedHosts``).
 public enum ApprovalDecision: String, Codable, Sendable {
     case approved
     case denied
 }
 
-/// A host's recorded decision about a device on the account.
+/// A recorded decision about another device on the account.
 public struct DeviceApproval: Codable, Sendable, Hashable, Identifiable {
     public var id: String { endpointID }
 
@@ -35,15 +36,22 @@ public struct DeviceApproval: Codable, Sendable, Hashable, Identifiable {
 ///
 /// Stored in the host's local Keychain and never synchronized: every device
 /// on the account can write the synchronized registry, so a decision stored
-/// there could be granted by the device asking for it.
+/// there could be granted by the device asking for it. Approvals don't
+/// expire; a device is cut off by a denial here, which
+/// ``applyRevocations(_:)`` records for every device revoked on the account.
 public struct DeviceApprovals: Sendable {
     private let store: any KeychainStoring
     private let service: String
 
     /// Creates an approval store over `store`.
     public init(store: any KeychainStoring, configuration: RemoteAccessConfiguration) {
+        self.init(store: store, service: configuration.approvalsService)
+    }
+
+    /// Creates a store of local decisions under `service`.
+    init(store: any KeychainStoring, service: String) {
         self.store = store
-        self.service = configuration.approvalsService
+        self.service = service
     }
 
     /// Every recorded decision, most recent first.
@@ -70,6 +78,23 @@ public struct DeviceApprovals: Sendable {
     /// Forgets the decision for `endpointID`, so the device must ask again.
     public func remove(endpointID: String) throws {
         try store.delete(service: service, account: endpointID, synchronized: false)
+    }
+
+    /// Records a denial for every revoked device not already denied, so it
+    /// stays cut off even if the revocation is deleted from the account.
+    /// Returns the endpoint IDs it denied.
+    @discardableResult
+    public func applyRevocations(_ revocations: [DeviceRevocation]) throws -> [String] {
+        var denied: [String] = []
+        for revocation in revocations where try decision(for: revocation.endpointID) != .denied {
+            try record(DeviceApproval(
+                endpointID: revocation.endpointID,
+                deviceName: revocation.deviceName,
+                decision: .denied
+            ))
+            denied.append(revocation.endpointID)
+        }
+        return denied
     }
 
     private static let encoder: JSONEncoder = {

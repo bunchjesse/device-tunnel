@@ -72,6 +72,18 @@ final class TCPStream: ByteStream {
         return stream
     }
 
+    /// The connection's local port, once it's ready.
+    var localPort: UInt16? {
+        guard case .hostPort(_, let port)? = connection.currentPath?.localEndpoint else { return nil }
+        return port.rawValue
+    }
+
+    /// The peer's port.
+    var remotePort: UInt16? {
+        guard case .hostPort(_, let port) = connection.endpoint else { return nil }
+        return port.rawValue
+    }
+
     private func start() {
         connection.stateUpdateHandler = { [weak self] state in
             self?.handle(state)

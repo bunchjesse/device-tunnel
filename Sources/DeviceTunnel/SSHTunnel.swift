@@ -152,9 +152,11 @@ enum SSHPipeline {
 /// The client's credentials and its check of the host's key.
 ///
 /// Only the key the host's endpoint ID names is trusted, never an address, so
-/// a stale or forged route fails with `hostKeyMismatch`. A host that turns the
-/// client's key away fails with `notRecognized`. NIOSSH stalls instead of
-/// closing in both cases, so the authenticator ends the connection itself.
+/// a stale or forged route fails with `hostKeyMismatch` — usually at the
+/// access gate already, and here for a device that copied the host's gate
+/// key. A host that turns the client's key away fails with `notRecognized`.
+/// NIOSSH stalls instead of closing in both cases, so the authenticator ends
+/// the connection itself.
 private final class ClientAuthenticator: NIOSSHClientUserAuthenticationDelegate, NIOSSHClientServerAuthenticationDelegate {
     private let key: NIOSSHPrivateKey
     private let username: String
@@ -176,8 +178,9 @@ private final class ClientAuthenticator: NIOSSHClientUserAuthenticationDelegate,
         // NIOSSH stalls rather than closing when the client runs out of
         // offers, so the watcher ends the connection with the reason.
         guard !hasOffered else {
-            // The host accepts every key its registry lists, so turning
-            // this one away means its registry doesn't list this device.
+            // The host accepts every key its registry knows, so turning
+            // this one away means its registry doesn't list this device
+            // yet, or the host couldn't read its Keychain.
             watcher.fail(RemoteAccessError.notRecognized)
             nextChallengePromise.succeed(nil)
             return
@@ -207,9 +210,10 @@ private final class ClientAuthenticator: NIOSSHClientUserAuthenticationDelegate,
 }
 
 /// Accepts an Ed25519 key that proves itself under this build flavor's
-/// username, when the host's registry lists it. Whether that device may use
-/// the host is decided afterwards, on the tunnel's control stream, where the
-/// host can explain a refusal.
+/// username, when the host's registry knows it — revoked keys included, so
+/// the host can tell a revoked device it's denied. Whether that device may
+/// use the host is decided afterwards, on the tunnel's control stream, where
+/// the host can explain a refusal.
 private final class ServerAuthenticator: NIOSSHServerUserAuthenticationDelegate, Sendable {
     private let username: String
     private let admits: @Sendable (String) -> Bool

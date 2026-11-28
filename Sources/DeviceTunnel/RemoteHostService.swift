@@ -1,14 +1,21 @@
 import Foundation
 import os
+import Synchronization
 
 /// Accepts tunnels from the account's other devices and forwards their
 /// streams to a local server on this device.
 ///
-/// A device gets through when three things hold: SSH authentication proved
-/// it owns its endpoint key, its record is in this host's copy of the synchronized
-/// registry (so it's signed in to the same Apple Account), and this host's
-/// user approved it once. It then receives an access token and each stream it
-/// opens is spliced to a TCP connection to the local server.
+/// A device gets through when four things hold: it proved at the access
+/// gate that it knows this host's gate key, SSH authentication proved it
+/// owns its endpoint key, its record is in this host's copy of the
+/// synchronized registry (so it's signed in to the same Apple Account) and
+/// not revoked, and this host's user approved it once. It then receives an
+/// access token and each stream it opens is spliced to a TCP connection to
+/// the local server.
+///
+/// The local server sees every tunneled stream as a loopback connection,
+/// so it must not trust loopback: require the token on every request, and
+/// ask ``tunneledDevice(fromLocalPort:)`` which device a connection carries.
 public actor RemoteHostService {
     /// What the host needs from the app.
     public struct Environment: Sendable {
@@ -25,7 +32,9 @@ public actor RemoteHostService {
         /// Stops accepting a device's API token.
         public var revokeToken: @Sendable (_ endpointID: String) async -> Void
         /// Asks the user whether `device` may connect. Returns nil when no
-        /// decision was made.
+        /// decision was made. The device chose its own name, so show
+        /// `device.fingerprint` and ask the user to check it matches the
+        /// ``DeviceIdentity/fingerprint`` the device shows.
         public var requestApproval: @Sendable (_ device: DeviceRecord) async -> ApprovalDecision?
         /// Whether this Mac currently accepts remote connections.
         public var isAcceptingConnections: @Sendable () async -> Bool
@@ -61,14 +70,22 @@ public actor RemoteHostService {
         public var id: String { endpointID }
         /// The device's endpoint ID.
         public let endpointID: String
-        /// The device's name from the registry.
+        /// The device's name from the registry, which the device chose.
         public let name: String
+        /// The device's ``DeviceRecord/fingerprint``, which it can't choose.
+        public let fingerprint: String
         /// How the device's tunnel reaches this Mac.
         public let path: ConnectionPath
     }
 
-    /// Oldest client protocol revision this host serves.
-    static let minimumProtocolVersion = 2
+    /// Oldest client protocol revision this host serves. A client older
+    /// than the access gate's revision fails at the gate and never gets
+    /// this far.
+    static let minimumProtocolVersion = 3
+
+    /// How often a running host re-reads the account's revocations, so a
+    /// revocation the revoked device deletes again still takes effect.
+    static let revocationCheckInterval: Duration = .seconds(60)
 
     /// Most tunnels that may be between arriving and being authorized at
     /// once. A device waiting on its approval prompt holds one.
@@ -84,11 +101,28 @@ public actor RemoteHostService {
         let connection: any TunnelConnection
     }
 
+    /// How far a tunnel between arriving and being authorized has come.
+    /// Later stages are turned away last when the handshake slots run out.
+    private enum Stage: Int, Comparable {
+        /// Running SSH.
+        case connecting
+        /// Authenticated; the device hasn't sent its hello yet.
+        case authenticated
+        /// Sent its hello; waiting on the host's user, or being looked up.
+        case awaitingDecision
+        /// Approved; finishing the handshake. Never turned away for room.
+        case approved
+
+        static func < (lhs: Stage, rhs: Stage) -> Bool { lhs.rawValue < rhs.rawValue }
+    }
+
     /// A tunnel between arriving and being authorized.
     private struct PendingHandshake {
         let incoming: any IncomingTunnel
         let arrived: ContinuousClock.Instant
-        var isAuthenticated = false
+        var stage = Stage.connecting
+        /// The device's endpoint ID, once it has authenticated.
+        var endpointID: String?
     }
 
     private let transport: any TunnelTransport
@@ -96,6 +130,8 @@ public actor RemoteHostService {
     private var tunnels: [UUID: ActiveTunnel] = [:]
     private var pendingApprovals: [String: Task<ApprovalDecision?, Never>] = [:]
     private var pendingHandshakes: [UUID: PendingHandshake] = [:]
+    /// The device each tunneled stream to the local server carries.
+    private nonisolated let tunneledStreams = TunneledStreams()
 
     /// Creates a host service that accepts tunnels on `node`.
     public init(node: RemoteNode, environment: Environment) {
@@ -107,12 +143,19 @@ public actor RemoteHostService {
         self.environment = environment
     }
 
-    /// Accepts tunnels until the node closes.
+    /// Accepts tunnels until the node closes, applying the account's
+    /// revocations first and every ``revocationCheckInterval`` after.
     public func run() async {
+        await applyRevocationsLogging()
+        let revocationChecks = Task { [weak self] in
+            while (try? await Task.sleep(for: Self.revocationCheckInterval)) != nil {
+                await self?.applyRevocationsLogging()
+            }
+        }
         await withDiscardingTaskGroup { group in
             while let incoming = await transport.nextIncoming() {
                 guard await makeRoomForHandshake() else {
-                    RemoteLog.host.warning("Refusing a tunnel: \(Self.maxPendingHandshakes) authenticated devices already waiting")
+                    RemoteLog.host.warning("Refusing a tunnel: \(Self.maxPendingHandshakes) approved devices already finishing their handshakes")
                     await incoming.refuse()
                     continue
                 }
@@ -120,23 +163,58 @@ public actor RemoteHostService {
                 pendingHandshakes[id] = PendingHandshake(incoming: incoming, arrived: .now)
                 group.addTask { await self.serve(incoming, id: id) }
             }
+            revocationChecks.cancel()
         }
     }
 
-    /// Frees a handshake slot when they're all taken by turning away the
-    /// oldest tunnel that hasn't authenticated, so connections anything on
-    /// the network can open can't lock out the account's devices. Returns
-    /// false when every slot holds an authenticated device.
+    /// ``applyRevocations()``, logging a failure.
+    private func applyRevocationsLogging() async {
+        do {
+            try await applyRevocations()
+        } catch {
+            RemoteLog.host.error("Couldn't apply revocations: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    /// Frees a handshake slot when they're all taken, so no device can lock
+    /// out the ones this host approved: turns away the least advanced
+    /// tunnel that isn't approved, oldest first. Returns false when every
+    /// slot holds an approved device finishing its handshake.
     private func makeRoomForHandshake() async -> Bool {
         guard pendingHandshakes.count >= Self.maxPendingHandshakes else { return true }
-        let oldest = pendingHandshakes
-            .filter { !$0.value.isAuthenticated }
-            .min { $0.value.arrived < $1.value.arrived }
-        guard let (id, handshake) = oldest else { return false }
+        let victim = pendingHandshakes
+            .filter { $0.value.stage < .approved }
+            .min { ($0.value.stage, $0.value.arrived) < ($1.value.stage, $1.value.arrived) }
+        guard let (id, handshake) = victim else { return false }
         pendingHandshakes[id] = nil
-        RemoteLog.host.info("Turning away a tunnel that hasn't authenticated to make room")
+        RemoteLog.host.info("Turning away a tunnel that isn't approved to make room")
         await handshake.incoming.refuse()
         return true
+    }
+
+    /// Records a permanent denial for every device revoked on the account,
+    /// and disconnects any that are connected. ``run()`` calls it
+    /// periodically; call it too whenever the registry may have changed, so
+    /// a revocation takes effect before anything can delete it.
+    public func applyRevocations() async throws {
+        let revocations = try environment.registry.revocations()
+        try environment.approvals.applyRevocations(revocations)
+        let connected = Set(tunnels.values.map(\.device.endpointID))
+        for revocation in revocations where connected.contains(revocation.endpointID) {
+            RemoteLog.host.notice("Disconnecting revoked device \(revocation.endpointID.prefix(12), privacy: .public)")
+            await disconnect(endpointID: revocation.endpointID)
+        }
+    }
+
+    /// The endpoint ID of the device whose tunneled stream reaches the
+    /// local server from `127.0.0.1:port`, or nil when that connection
+    /// didn't come through a tunnel — some other process on this device
+    /// made it, and it must be treated as untrusted. Look a connection up
+    /// as soon as it's accepted, while the tunnel's end of it is still
+    /// open, and still require the device's token: once a tunneled
+    /// connection closes, another process may reuse its port.
+    public nonisolated func tunneledDevice(fromLocalPort port: UInt16) -> String? {
+        tunneledStreams.device(fromLocalPort: port)
     }
 
     /// Closes every tunnel from `endpointID` and revokes its API token, after
@@ -189,8 +267,9 @@ public actor RemoteHostService {
             return
         }
 
-        pendingHandshakes[id]?.isAuthenticated = true
         let endpointID = connection.remoteEndpointID
+        pendingHandshakes[id]?.stage = .authenticated
+        pendingHandshakes[id]?.endpointID = endpointID
         let control: any ByteStream
         let hello: ClientHello
         do {
@@ -201,8 +280,10 @@ public actor RemoteHostService {
             connection.close(reason: "no hello")
             return
         }
+        await supersedeWaitingHandshakes(from: endpointID, keeping: id)
+        pendingHandshakes[id]?.stage = .awaitingDecision
 
-        guard case .granted(let record, let token) = await authorize(endpointID: endpointID, hello: hello, control: control, connection: connection) else {
+        guard case .granted(let record, let token) = await authorize(endpointID: endpointID, hello: hello, control: control, connection: connection, handshake: id) else {
             try? await control.finish()
             // Give the refusal time to arrive; the client closes once it reads it.
             _ = try? await withTimeout(.seconds(5)) { await connection.waitUntilClosed() }
@@ -220,7 +301,7 @@ public actor RemoteHostService {
 
         let tunnelID = UUID()
         tunnels[tunnelID] = ActiveTunnel(
-            device: ConnectedDevice(endpointID: endpointID, name: record.name, path: connection.path),
+            device: ConnectedDevice(endpointID: endpointID, name: record.name, fingerprint: record.fingerprint, path: connection.path),
             connection: connection
         )
         // A client holds one tunnel per host; an older one from this device
@@ -246,14 +327,36 @@ public actor RemoteHostService {
         RemoteLog.host.info("Tunnel open from \(record.name, privacy: .public) (\(endpointID.prefix(12), privacy: .public))")
         await publishConnections()
 
-        await Self.forwardStreams(on: connection, localPort: environment.localPort)
+        await Self.forwardStreams(on: connection, endpointID: endpointID, localPort: environment.localPort, tunneledStreams: tunneledStreams)
 
         tunnels[tunnelID] = nil
         RemoteLog.host.info("Tunnel closed from \(record.name, privacy: .public)")
         await publishConnections()
     }
 
-    private func authorize(endpointID: String, hello: ClientHello, control: any ByteStream, connection: any TunnelConnection) async -> Authorization {
+    /// Closes the handshakes from `endpointID`, other than `kept`, that
+    /// already sent their hello. A device has one tunnel per host in
+    /// handshake at a time — the one it's using now — so the earlier ones
+    /// were abandoned, and closing them keeps one device from holding many
+    /// slots while its approval prompt is up. Handshakes still before their
+    /// hello are a client racing paths, which it closes itself.
+    private func supersedeWaitingHandshakes(from endpointID: String, keeping kept: UUID) async {
+        let superseded = pendingHandshakes.filter {
+            $0.key != kept && $0.value.endpointID == endpointID && $0.value.stage == .awaitingDecision
+        }
+        for (supersededID, handshake) in superseded {
+            pendingHandshakes[supersededID] = nil
+            await handshake.incoming.refuse()
+        }
+    }
+
+    private func authorize(
+        endpointID: String,
+        hello: ClientHello,
+        control: any ByteStream,
+        connection: any TunnelConnection,
+        handshake: UUID
+    ) async -> Authorization {
         let hostName = await environment.hostName()
 
         func refuse(_ reply: HostReply) async -> Authorization {
@@ -271,6 +374,11 @@ public actor RemoteHostService {
         let record: DeviceRecord
         let storedDecision: ApprovalDecision?
         do {
+            if let revocation = try environment.registry.revocation(for: endpointID) {
+                RemoteLog.host.notice("Refusing \(endpointID.prefix(12), privacy: .public): revoked on the account")
+                try environment.approvals.applyRevocations([revocation])
+                return await refuse(.denied(hostName: hostName))
+            }
             guard let found = try environment.registry.record(for: endpointID) else {
                 RemoteLog.host.info("Refusing \(endpointID.prefix(12), privacy: .public): not in the registry")
                 return await refuse(.unknownDevice)
@@ -292,7 +400,7 @@ public actor RemoteHostService {
 
         switch decision {
         case .approved?:
-            break
+            pendingHandshakes[handshake]?.stage = .approved
         case .denied?:
             return await refuse(.denied(hostName: hostName))
         case nil:
@@ -349,11 +457,14 @@ public actor RemoteHostService {
         await environment.connectionsChanged(devices)
     }
 
-    /// Splices every stream the peer opens to a fresh TCP connection to the
-    /// local server, until the tunnel closes.
+    /// Splices every stream the peer `endpointID` opens to a fresh TCP
+    /// connection to the local server, until the tunnel closes, recording
+    /// each connection's local port in `tunneledStreams` while it's open.
     private nonisolated static func forwardStreams(
         on connection: any TunnelConnection,
-        localPort: @escaping @Sendable () async -> UInt16?
+        endpointID: String,
+        localPort: @escaping @Sendable () async -> UInt16?,
+        tunneledStreams: TunneledStreams
     ) async {
         await withDiscardingTaskGroup { group in
             while let stream = try? await connection.acceptStream() {
@@ -365,7 +476,18 @@ public actor RemoteHostService {
                     }
                     do {
                         let server = try await TCPStream.connectToLoopback(port: port)
+                        guard let sourcePort = server.localPort else {
+                            RemoteLog.host.error("Dropped a stream: its connection to the local server has no port")
+                            await server.abort()
+                            await stream.abort()
+                            return
+                        }
+                        // Registered before any byte flows, so the server
+                        // can look the connection up as soon as it reads,
+                        // and kept until the connection is fully closed.
+                        tunneledStreams.register(localPort: sourcePort, endpointID: endpointID)
                         await StreamSplice.run(stream, server)
+                        tunneledStreams.unregister(localPort: sourcePort)
                     } catch {
                         RemoteLog.host.debug("Dropped a stream: \(error.localizedDescription, privacy: .public)")
                         await stream.abort()
@@ -373,5 +495,26 @@ public actor RemoteHostService {
                 }
             }
         }
+    }
+}
+
+/// Which device each tunneled connection to the local server carries, by
+/// the connection's source port on the loopback interface.
+final class TunneledStreams: Sendable {
+    private let devices = Mutex<[UInt16: String]>([:])
+
+    /// The endpoint ID of the device the connection from `port` carries.
+    func device(fromLocalPort port: UInt16) -> String? {
+        devices.withLock { $0[port] }
+    }
+
+    /// Records that the connection from `localPort` carries `endpointID`.
+    func register(localPort: UInt16, endpointID: String) {
+        devices.withLock { $0[localPort] = endpointID }
+    }
+
+    /// Forgets the connection from `localPort`, which has closed.
+    func unregister(localPort: UInt16) {
+        _ = devices.withLock { $0.removeValue(forKey: localPort) }
     }
 }

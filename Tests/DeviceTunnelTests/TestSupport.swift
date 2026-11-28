@@ -125,9 +125,11 @@ func makeConfiguration(discovery: Bool = false) -> RemoteAccessConfiguration {
     )
 }
 
-/// A record for a device with `endpointID`.
+/// A record for a device with `endpointID`. The default gate key makes it
+/// a current-protocol record; pass nil for one from an older build.
 func makeRecord(
     endpointID: String,
+    gateKey: Data? = Data(repeating: 7, count: 32),
     name: String = "Test Device",
     platform: DevicePlatform = .iOS,
     canHost: Bool = false,
@@ -136,12 +138,31 @@ func makeRecord(
 ) -> DeviceRecord {
     DeviceRecord(
         endpointID: endpointID,
+        gateKey: gateKey,
         name: name,
         platform: platform,
         canHost: canHost,
         directAddresses: directAddresses,
         relayAddress: relayAddress
     )
+}
+
+/// A trust store that trusts `host`.
+func trusting(_ host: DeviceRecord) throws -> TrustedHosts {
+    let trustedHosts = TrustedHosts(store: InMemoryKeychainStore(), configuration: makeConfiguration())
+    try trustedHosts.trust(host)
+    return trustedHosts
+}
+
+/// A Keychain that fails every call, as one read before first unlock does.
+struct UnreadableKeychainStore: KeychainStoring {
+    /// The failure every call throws.
+    static let error = KeychainError(status: errSecInteractionNotAllowed)
+
+    func read(service: String, account: String, synchronized: Bool) throws -> Data? { throw Self.error }
+    func readAll(service: String, synchronized: Bool) throws -> [KeychainItem] { throw Self.error }
+    func write(_ data: Data, service: String, account: String, synchronized: Bool) throws { throw Self.error }
+    func delete(service: String, account: String, synchronized: Bool) throws { throw Self.error }
 }
 
 /// Collects a link's state transitions so a test can wait for one.

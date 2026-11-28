@@ -29,8 +29,8 @@ public struct RemoteAccessConfiguration: Sendable, Hashable {
     public let serviceType: String?
 
     /// Names one of several processes of the same build on one Mac, giving
-    /// each its own identity and approvals so they act as different
-    /// devices. The registry stays shared. Nil for a normal install.
+    /// each its own identity, approvals, and trusted hosts so they act as
+    /// different devices. The registry stays shared. Nil for a normal install.
     public let localInstance: String?
 
     /// Creates a configuration. `protocolName` and `serviceType` should
@@ -63,7 +63,14 @@ public struct RemoteAccessConfiguration: Sendable, Hashable {
     /// Service holding one synchronized record per device on the account.
     var registryService: String { keychainServicePrefix + ".remote.devices" }
 
+    /// Service holding one synchronized revocation per revoked device.
+    var revocationsService: String { keychainServicePrefix + ".remote.revoked" }
+
     /// Service holding this host's approval decisions. Never synchronized,
     /// so a device on the account can't approve itself.
     var approvalsService: String { keychainServicePrefix + ".remote.approvals" + localSuffix }
+
+    /// Service holding this client's decisions about hosts. Never
+    /// synchronized, so a device on the account can't make itself trusted.
+    var trustedHostsService: String { keychainServicePrefix + ".remote.trusted-hosts" + localSuffix }
 }

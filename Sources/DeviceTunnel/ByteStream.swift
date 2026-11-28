@@ -12,10 +12,11 @@ public enum RemoteAccessError: Error, LocalizedError, Equatable {
     case unexpectedEndOfStream
     /// A local TCP listener or connection failed.
     case localSocketFailed(String)
-    /// The host presented a key other than the one its registry record names.
+    /// The device that answered isn't the host the record names: it
+    /// couldn't prove the host's gate key, or presented another SSH key.
     case hostKeyMismatch
-    /// The host's copy of the registry doesn't list this device yet, so it
-    /// turned the device's key away.
+    /// The host turned the device's key away: its copy of the registry
+    /// doesn't list this device yet, or it couldn't read its Keychain.
     case notRecognized
     /// The host's record lists no address to reach it at.
     case noRoute
@@ -23,6 +24,9 @@ public enum RemoteAccessError: Error, LocalizedError, Equatable {
     case localNetworkDenied
     /// The relay turned the connection down.
     case relayRefused(RelayRefusal)
+    /// The other device's record lacks what this protocol revision needs
+    /// to reach it, because it runs an older build.
+    case outdatedPeer
 
     public var errorDescription: String? {
         switch self {
@@ -39,6 +43,7 @@ public enum RemoteAccessError: Error, LocalizedError, Equatable {
         case .relayRefused(.busy): "The relay is busy."
         case .relayRefused(.namespaceNotAllowed): "The relay doesn't serve this app."
         case .relayRefused: "The relay refused the connection."
+        case .outdatedPeer: "The other device needs a newer version of the app."
         }
     }
 }

@@ -166,6 +166,54 @@ struct DeviceRegistryTests {
 
         #expect(try registry.record(for: "a") == nil)
     }
+
+    /// A revoked device's record is hidden on every device, even after the
+    /// device publishes it again, until the revocation is withdrawn.
+    @Test func revokedDeviceIsHiddenEverywhere() throws {
+        let synced = InMemoryKeychainStore.SyncedStorage()
+        let configuration = makeConfiguration()
+        let mac = DeviceRegistry(store: InMemoryKeychainStore(synced: synced), configuration: configuration)
+        let phone = DeviceRegistry(store: InMemoryKeychainStore(synced: synced), configuration: configuration)
+        try phone.publish(makeRecord(endpointID: "a", name: "Lost iPhone"))
+
+        try mac.revoke(DeviceRevocation(endpointID: "a", deviceName: "Lost iPhone"))
+        try phone.publish(makeRecord(endpointID: "a", name: "Lost iPhone"))
+
+        #expect(try mac.record(for: "a") == nil)
+        #expect(try mac.records().isEmpty)
+        #expect(try mac.knows(endpointID: "a"))
+        #expect(try phone.revocations().map(\.endpointID) == ["a"])
+
+        try mac.unrevoke(endpointID: "a")
+        #expect(try mac.record(for: "a")?.name == "Lost iPhone")
+    }
+}
+
+struct FingerprintTests {
+    /// A fingerprint is four groups of four hex digits, the same for one
+    /// key on every device and different for another key, so people can
+    /// compare it where names prove nothing.
+    @Test func fingerprintsNameKeys() throws {
+        let identity = try DeviceIdentity(secretKey: Data(repeating: 1, count: 32))
+        let other = try DeviceIdentity(secretKey: Data(repeating: 2, count: 32))
+        let record = makeRecord(endpointID: identity.endpointID)
+
+        #expect(identity.fingerprint == record.fingerprint)
+        #expect(identity.fingerprint != other.fingerprint)
+        #expect(identity.fingerprint.wholeMatch(of: /[0-9a-f]{4}(-[0-9a-f]{4}){3}/) != nil)
+    }
+
+    /// The gate key is fixed for a key, differs between keys, and isn't
+    /// the private key.
+    @Test func gateKeyIsDerivedFromTheDeviceKey() throws {
+        let secret = Data(repeating: 1, count: 32)
+        let identity = try DeviceIdentity(secretKey: secret)
+
+        #expect(identity.gateKey.count == 32)
+        #expect(identity.gateKey == (try DeviceIdentity(secretKey: secret)).gateKey)
+        #expect(identity.gateKey != (try DeviceIdentity(secretKey: Data(repeating: 2, count: 32))).gateKey)
+        #expect(identity.gateKey != secret)
+    }
 }
 
 struct DeviceApprovalsTests {
@@ -193,6 +241,37 @@ struct DeviceApprovalsTests {
 
         let otherDevice = DeviceApprovals(store: InMemoryKeychainStore(synced: synced), configuration: configuration)
         #expect(try otherDevice.all().isEmpty)
+    }
+
+    /// Applying revocations denies each revoked device once, overriding an
+    /// approval, and reports only the devices it newly denied.
+    @Test func revocationsBecomeDenials() throws {
+        let approvals = DeviceApprovals(store: InMemoryKeychainStore(), configuration: makeConfiguration())
+        try approvals.record(DeviceApproval(endpointID: "a", deviceName: "iPhone", decision: .approved))
+        let revocations = [DeviceRevocation(endpointID: "a", deviceName: "iPhone"), DeviceRevocation(endpointID: "b", deviceName: "iPad")]
+
+        #expect(try approvals.applyRevocations(revocations).sorted() == ["a", "b"])
+        #expect(try approvals.applyRevocations(revocations).isEmpty)
+        #expect(try approvals.decision(for: "a") == .denied)
+    }
+}
+
+struct TrustedHostsTests {
+    /// A client's trust in a host is local, never synchronized, so no
+    /// device on the account can make itself trusted; and it's separate
+    /// from the approvals the same device keeps as a host.
+    @Test func trustIsLocalAndSeparateFromApprovals() throws {
+        let synced = InMemoryKeychainStore.SyncedStorage()
+        let configuration = makeConfiguration()
+        let store = InMemoryKeychainStore(synced: synced)
+        let trusted = TrustedHosts(store: store, configuration: configuration)
+        let host = makeRecord(endpointID: "h", canHost: true)
+
+        try trusted.trust(host)
+
+        #expect(try trusted.decision(for: "h") == .approved)
+        #expect(try DeviceApprovals(store: store, configuration: configuration).decision(for: "h") == nil)
+        #expect(try TrustedHosts(store: InMemoryKeychainStore(synced: synced), configuration: configuration).decision(for: "h") == nil)
     }
 }
 

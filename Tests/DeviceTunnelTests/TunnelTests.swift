@@ -2,6 +2,7 @@ import CryptoKit
 import Foundation
 import Network
 import NIOCore
+import NIOEmbedded
 import Synchronization
 import Testing
 @testable import DeviceTunnel
@@ -15,6 +16,8 @@ struct TunnelFixture {
     let clientNode: RemoteNode
     let hostRecord: DeviceRecord
     let clientRecord: DeviceRecord
+    /// The client's trust store, which trusts the fixture's host.
+    let trustedHosts: TrustedHosts
     let apiServer: LoopbackListener
     let apiPort: UInt16
 
@@ -52,12 +55,15 @@ struct TunnelFixture {
 
         let hostRecord = DeviceRecord(
             endpointID: hostIdentity.endpointID,
+            gateKey: hostIdentity.gateKey,
             name: "Studio",
             platform: .macOS,
             canHost: true,
             directAddresses: hostNode.address()
         )
-        let clientRecord = makeRecord(endpointID: clientIdentity.endpointID, name: "iPhone")
+        let clientRecord = makeRecord(endpointID: clientIdentity.endpointID, gateKey: clientIdentity.gateKey, name: "iPhone")
+        let trustedHosts = TrustedHosts(store: clientStore, configuration: configuration)
+        try trustedHosts.trust(hostRecord)
 
         return TunnelFixture(
             configuration: configuration,
@@ -66,6 +72,7 @@ struct TunnelFixture {
             clientNode: clientNode,
             hostRecord: hostRecord,
             clientRecord: clientRecord,
+            trustedHosts: trustedHosts,
             apiServer: apiServer,
             apiPort: apiPort
         )
@@ -111,9 +118,16 @@ struct TunnelFixture {
     }
 
     /// Starts a client link to `host` (the fixture's host by default),
-    /// recording its states.
+    /// recording its states. The client trusts `host` first, as its user
+    /// would have; `LinkTests` covers hosts the user hasn't trusted.
     func startLink(recorder: StateRecorder, host: DeviceRecord? = nil) async -> RemoteHostLink {
-        let link = RemoteHostLink(node: clientNode, host: host ?? hostRecord) { state in
+        let host = host ?? hostRecord
+        do {
+            try trustedHosts.trust(host)
+        } catch {
+            Issue.record(error, "Couldn't trust the host")
+        }
+        let link = RemoteHostLink(node: clientNode, host: host, trustedHosts: trustedHosts) { state in
             await recorder.record(state)
         }
         await link.start()
@@ -528,22 +542,24 @@ struct TunnelTests {
         await fixture.tearDown(link: link, host: host)
     }
 
-    /// A server answering at the host's address with a key other than the
-    /// one the registry lists is never trusted: the client stays
-    /// unreachable instead of sending its hello to an impostor.
+    /// A server answering at the host's address that can't prove it knows
+    /// the gate key of the host the registry lists is never trusted: the
+    /// client stays unreachable instead of sending anything to an impostor.
     @Test func hostWithTheWrongKeyIsRejected() async throws {
         let fixture = try await TunnelFixture.make()
         try fixture.approveClient()
         let host = fixture.startHost()
-        let impostor = DeviceRecord(
-            endpointID: Curve25519.Signing.PrivateKey().publicKey.rawRepresentation.hexEncoded,
+        let impostor = try DeviceIdentity(secretKey: Curve25519.Signing.PrivateKey().rawRepresentation)
+        let impostorRecord = DeviceRecord(
+            endpointID: impostor.endpointID,
+            gateKey: impostor.gateKey,
             name: "Studio",
             platform: .macOS,
             canHost: true,
             directAddresses: fixture.hostRecord.directAddresses
         )
         let recorder = StateRecorder()
-        let link = await fixture.startLink(recorder: recorder, host: impostor)
+        let link = await fixture.startLink(recorder: recorder, host: impostorRecord)
 
         let state = await recorder.first(where: \.isUnreachable)
         #expect(state == .unreachable(reason: RemoteAccessError.hostKeyMismatch.localizedDescription))
@@ -624,9 +640,10 @@ struct HostAdmissionTests {
         fixture.apiServer.stop()
     }
 
-    /// Connections that never finish the SSH handshake — anything on the
-    /// network can open them — can't fill the host's handshake slots and
-    /// lock out a registered device: the oldest of them makes way.
+    /// Connections that never answer the access gate — anything on the
+    /// network can open them — can't lock out a registered device: they
+    /// never reach the host's handshake slots, and the gate's limiter turns
+    /// away the oldest of them to make room.
     @Test func idleConnectionsCantLockOutARegisteredDevice() async throws {
         let fixture = try await TunnelFixture.make()
         try fixture.approveClient()
@@ -647,6 +664,122 @@ struct HostAdmissionTests {
         for connection in idle { await connection.abort() }
         await fixture.tearDown(link: link, host: host)
     }
+
+    /// A device revoked on the account is cut off and denied, and stays
+    /// denied after the revocation is deleted and its record republished —
+    /// which the revoked device itself could do.
+    @Test func revokedDeviceStaysDenied() async throws {
+        let fixture = try await TunnelFixture.make()
+        try fixture.approveClient()
+        let revocations = LockedCounter()
+        let service = fixture.makeHostService(revocations: revocations)
+        let host = Task { await service.run() }
+        let recorder = StateRecorder()
+        let link = await fixture.startLink(recorder: recorder)
+        _ = await recorder.first { $0.connectedPort != nil }
+
+        try fixture.registry.revoke(DeviceRevocation(endpointID: fixture.clientRecord.endpointID, deviceName: "iPhone"))
+        try await service.applyRevocations()
+        _ = await recorder.first { $0 == .denied(hostName: "Studio") }
+        #expect(revocations.value == 1)
+        #expect(try fixture.approvals.decision(for: fixture.clientRecord.endpointID) == .denied)
+
+        try fixture.registry.unrevoke(endpointID: fixture.clientRecord.endpointID)
+        try fixture.registry.publish(fixture.clientRecord)
+        let retried = StateRecorder()
+        let retry = await fixture.startLink(recorder: retried)
+        _ = await retried.first { $0 == .denied(hostName: "Studio") }
+
+        await retry.stop()
+        await fixture.tearDown(link: link, host: host)
+    }
+
+    /// A revoked device that connects is denied, and the host records the
+    /// denial then, even if ``RemoteHostService/applyRevocations()`` hasn't
+    /// run since the revocation.
+    @Test func revokedDeviceIsDeniedOnArrival() async throws {
+        let fixture = try await TunnelFixture.make()
+        try fixture.approveClient()
+        let host = fixture.startHost()
+        try fixture.registry.revoke(DeviceRevocation(endpointID: fixture.clientRecord.endpointID, deviceName: "iPhone"))
+        let recorder = StateRecorder()
+        let link = await fixture.startLink(recorder: recorder)
+
+        _ = await recorder.first { $0 == .denied(hostName: "Studio") }
+        #expect(try fixture.approvals.decision(for: fixture.clientRecord.endpointID) == .denied)
+
+        await fixture.tearDown(link: link, host: host)
+    }
+
+    /// One device can hold only one handshake waiting on the host's user:
+    /// each new hello from it closes its earlier waiting tunnel, so it
+    /// can't fill the slots that other devices need.
+    @Test func oneDeviceHoldsOneWaitingHandshake() async throws {
+        let fixture = try await TunnelFixture.make()
+        try fixture.registry.publish(fixture.clientRecord)
+        let prompts = LockedCounter()
+        let host = fixture.startHost(prompts: prompts) { _ in
+            try? await Task.sleep(for: .seconds(30))
+            return nil
+        }
+
+        func waitForApproval() async throws -> any TunnelConnection {
+            let connection = try await fixture.clientNode.connect(to: fixture.hostRecord, allowingRelay: false)
+            let control = try await connection.openStream()
+            try await FrameCodec.write(ClientHello(protocolVersion: DeviceRecord.currentProtocolVersion), to: control)
+            #expect(try await FrameCodec.read(HostReply.self, from: control) == .pendingApproval(hostName: "Studio"))
+            return connection
+        }
+        let first = try await waitForApproval()
+        let second = try await waitForApproval()
+
+        try await withTimeout(.seconds(5)) { await first.waitUntilClosed() }
+        #expect(prompts.value == 1)
+
+        second.close(reason: "done")
+        await fixture.clientNode.close()
+        await fixture.hostNode.close()
+        await host.value
+        fixture.apiServer.stop()
+    }
+
+    /// The local server can tell which device a tunneled connection
+    /// carries from the connection's source port, and that a connection
+    /// some other local process made carries none.
+    @Test func localServerCanAttributeTunneledConnections() async throws {
+        let fixture = try await TunnelFixture.make()
+        try fixture.approveClient()
+        let seen = Locked<[String?]>([])
+        let serviceBox = Locked<RemoteHostService?>(nil)
+        let server = try LoopbackListener(onConnection: { connection in
+            seen.value.append(connection.remotePort.flatMap { serviceBox.value?.tunneledDevice(fromLocalPort: $0) })
+            Task { await echoUntilFinished(connection) }
+        }, onFailure: { _ in })
+        let serverPort = try await server.start()
+        let service = RemoteHostService(node: fixture.hostNode, environment: RemoteHostService.Environment(
+            registry: fixture.registry,
+            approvals: fixture.approvals,
+            hostName: { "Studio" },
+            localPort: { serverPort },
+            token: { _ in "token" },
+            revokeToken: { _ in },
+            requestApproval: { _ in .approved },
+            isAcceptingConnections: { true },
+            connectionsChanged: { _ in }
+        ))
+        serviceBox.value = service
+        let host = Task { await service.run() }
+        let recorder = StateRecorder()
+        let link = await fixture.startLink(recorder: recorder)
+        let port = try #require(await recorder.first { $0.connectedPort != nil }.connectedPort)
+
+        #expect(try await echo("tunneled", throughPort: port) == "tunneled")
+        #expect(try await echo("local", throughPort: serverPort) == "local")
+
+        #expect(seen.value == [fixture.clientRecord.endpointID, nil])
+        server.stop()
+        await fixture.tearDown(link: link, host: host)
+    }
 }
 
 @Suite(.timeLimit(.minutes(1)))
@@ -655,6 +788,12 @@ struct DiscoveryTests {
     private func route(to fixture: TunnelFixture) throws -> NWEndpoint {
         let port = try #require(fixture.hostNode.listeningPort.flatMap(NWEndpoint.Port.init(rawValue:)))
         return .hostPort(host: .ipv4(.loopback), port: port)
+    }
+
+    /// An advertisement for `route` as the host with `gateKey` publishes one.
+    private func advertisement(at route: NWEndpoint, gateKey: Data) -> Advertisement {
+        let salt = AccessGate.randomBytes(AccessGate.advertisementSaltLength)
+        return Advertisement(endpoint: route, salt: salt, tag: AccessGate.advertisementTag(gateKey: gateKey, salt: salt))
     }
 
     /// A host found on the local network is dialed at the route discovery
@@ -666,7 +805,8 @@ struct DiscoveryTests {
         var stale = fixture.hostRecord
         stale.directAddresses = ["192.0.2.1:9"]
 
-        fixture.clientNode.discovered([fixture.hostRecord.endpointID: [try route(to: fixture)]])
+        let gateKey = try #require(fixture.hostRecord.gateKey)
+        fixture.clientNode.discovered([advertisement(at: try route(to: fixture), gateKey: gateKey)])
         let connection = try await fixture.clientNode.connect(to: stale, allowingRelay: false)
 
         #expect(connection.remoteEndpointID == fixture.hostRecord.endpointID)
@@ -675,17 +815,21 @@ struct DiscoveryTests {
         await fixture.hostNode.close()
     }
 
-    /// Subscribers hear which hosts gained or changed routes, so their
-    /// links can redial at once, and hear nothing when nothing changed.
+    /// Subscribers hear which known hosts gained or changed routes, so
+    /// their links can redial at once, and hear nothing when nothing
+    /// changed or the advertisement belongs to no host they know.
     @Test func newRoutesAreReported() async throws {
         let fixture = try await TunnelFixture.make()
         let reported = Mutex<[Set<String>]>([])
         fixture.clientNode.onRoutesChange { ids in reported.withLock { $0.append(ids) } }
-        let routes = [fixture.hostRecord.endpointID: [try route(to: fixture)]]
+        fixture.clientNode.remember(host: fixture.hostRecord)
+        let gateKey = try #require(fixture.hostRecord.gateKey)
+        let ours = advertisement(at: try route(to: fixture), gateKey: gateKey)
+        let stranger = advertisement(at: try route(to: fixture), gateKey: AccessGate.randomBytes(32))
 
-        fixture.clientNode.discovered(routes)
-        fixture.clientNode.discovered(routes)
-        fixture.clientNode.discovered([:])
+        fixture.clientNode.discovered([ours, stranger])
+        fixture.clientNode.discovered([ours, stranger])
+        fixture.clientNode.discovered([stranger])
 
         #expect(reported.withLock { $0 } == [[fixture.hostRecord.endpointID]])
         await fixture.clientNode.close()
@@ -710,24 +854,169 @@ struct DiscoveryTests {
         await fixture.tearDown(link: link, host: host)
     }
 
-    /// A browse result carries the host's endpoint ID in its TXT record;
-    /// results without a well-formed one are ignored, and so is this
-    /// device's own advertisement.
-    @Test func browseResultsAreKeyedByEndpointID() {
-        let ownID = String(repeating: "a", count: 64)
-        let hostID = String(repeating: "b", count: 64)
-        let endpoint = NWEndpoint.service(name: "Studio", type: "_example._tcp", domain: "local.", interface: nil)
+    /// An advertisement names its host only to a device that knows the
+    /// host's gate key: it carries a fresh salt and a tag, never the
+    /// endpoint ID, and two advertisements from one host share nothing.
+    /// Malformed advertisements are ignored, and so is this device's own.
+    @Test func advertisementsAreBlinded() throws {
+        let ownKey = AccessGate.randomBytes(32)
+        let hostKey = AccessGate.randomBytes(32)
+        let endpoint = NWEndpoint.service(name: "x", type: "_example._tcp", domain: "local.", interface: nil)
+        func txt(_ service: NWListener.Service) throws -> NWTXTRecord {
+            try #require(service.txtRecordObject)
+        }
+        let first = NWListener.Service.tunnel(serviceType: "_example._tcp", gateKey: hostKey)
+        let second = NWListener.Service.tunnel(serviceType: "_example._tcp", gateKey: hostKey)
 
-        let routes = ServiceBrowser.routes(
+        #expect(first.name != second.name)
+        #expect(try txt(first)[ServiceBrowser.saltKey] != txt(second)[ServiceBrowser.saltKey])
+        #expect(try txt(first)[ServiceBrowser.tagKey] != txt(second)[ServiceBrowser.tagKey])
+
+        let found = ServiceBrowser.advertisements(
             from: [
-                (endpoint, NWTXTRecord(["id": hostID])),
-                (endpoint, NWTXTRecord(["id": ownID])),
-                (endpoint, NWTXTRecord(["id": "not-a-key"])),
-                (endpoint, NWTXTRecord([:])),
+                (endpoint, try txt(first)),
+                (endpoint, try txt(NWListener.Service.tunnel(serviceType: "_example._tcp", gateKey: ownKey))),
+                (endpoint, NWTXTRecord(["s": "zz", "t": "zz"])),
+                (endpoint, NWTXTRecord(["id": String(repeating: "b", count: 64)])),
             ],
-            excluding: ownID
+            excludingGateKey: ownKey
         )
 
-        #expect(routes == [hostID: [endpoint]])
+        #expect(found.count == 1)
+        #expect(found.first?.isAdvertised(byGateKey: hostKey) == true)
+        #expect(found.first?.isAdvertised(byGateKey: AccessGate.randomBytes(32)) == false)
+    }
+}
+
+/// The exchange in front of SSH that keeps everyone off the account away
+/// from a host's SSH server.
+@Suite(.timeLimit(.minutes(1)))
+struct AccessGateTests {
+    /// Reads the host's challenge from a raw connection to its port.
+    private func challenge(from stream: TCPStream) async throws -> Data {
+        try await stream.readExactly(AccessGate.challengeLength)
+    }
+
+    /// Anyone who connects to a host learns nothing that identifies it: the
+    /// host's challenge carries neither its endpoint ID nor an SSH banner,
+    /// and a wrong answer gets the connection closed without SSH starting.
+    @Test func hostRevealsNothingToStrangers() async throws {
+        let fixture = try await TunnelFixture.make()
+        let port = try #require(fixture.hostNode.listeningPort)
+        let stream = try await TCPStream.connectToLoopback(port: port)
+
+        let received = try await challenge(from: stream)
+        #expect(received.starts(with: AccessGate.magic))
+        let hostKey = try #require(Data(hexEncoded: fixture.hostRecord.endpointID))
+        #expect(received.range(of: hostKey) == nil)
+
+        try await stream.write(AccessGate.randomBytes(AccessGate.proofLength))
+        let after = try await withTimeout(.seconds(5)) { try await readToEnd(stream) }
+        #expect(after.isEmpty)
+
+        await stream.abort()
+        await fixture.clientNode.close()
+        await fixture.hostNode.close()
+    }
+
+    /// A connection that never answers the challenge is closed after the
+    /// gate's timeout instead of holding a slot.
+    @Test func silentConnectionIsClosed() async throws {
+        let fixture = try await TunnelFixture.make()
+        let port = try #require(fixture.hostNode.listeningPort)
+        let stream = try await TCPStream.connectToLoopback(port: port)
+        _ = try await challenge(from: stream)
+
+        let rest = try await withTimeout(.seconds(10)) { try await readToEnd(stream) }
+        #expect(rest.isEmpty)
+
+        await stream.abort()
+        await fixture.clientNode.close()
+        await fixture.hostNode.close()
+    }
+
+    /// A client that knows the host's gate key passes and reaches SSH: the
+    /// host answers a correct proof with its SSH banner.
+    @Test func correctProofReachesSSH() async throws {
+        let fixture = try await TunnelFixture.make()
+        let port = try #require(fixture.hostNode.listeningPort)
+        let stream = try await TCPStream.connectToLoopback(port: port)
+        let received = try await challenge(from: stream)
+        let nonce = received.dropFirst(AccessGate.magic.count).prefix(AccessGate.nonceLength)
+        let gateKey = try #require(fixture.hostRecord.gateKey)
+
+        try await stream.write(AccessGate.clientProof(gateKey: gateKey, nonce: Data(nonce)))
+        let banner = try await withTimeout(.seconds(5)) { try await stream.readExactly(4) }
+        #expect(banner == Data("SSH-".utf8))
+
+        await stream.abort()
+        await fixture.clientNode.close()
+        await fixture.hostNode.close()
+    }
+
+    /// A device on the account that copies a real host's gate key into a
+    /// record under its own key still fails: the gate passes, but SSH finds
+    /// the real host's key where the record names another.
+    @Test func copiedGateKeyStillFailsTheHostKeyCheck() async throws {
+        let fixture = try await TunnelFixture.make()
+        try fixture.approveClient()
+        let host = fixture.startHost()
+        var forged = makeRecord(
+            endpointID: Curve25519.Signing.PrivateKey().publicKey.rawRepresentation.hexEncoded,
+            gateKey: fixture.hostRecord.gateKey,
+            canHost: true
+        )
+        forged.directAddresses = fixture.hostRecord.directAddresses
+
+        await #expect(throws: RemoteAccessError.hostKeyMismatch) {
+            _ = try await fixture.clientNode.connect(to: forged, allowingRelay: false)
+        }
+
+        await fixture.clientNode.close()
+        await fixture.hostNode.close()
+        await host.value
+        fixture.apiServer.stop()
+    }
+
+    /// The limiter keeps each source to its share of waiting connections,
+    /// closing its oldest to make way, and counts an IPv6 /64 as one source.
+    @Test func limiterBoundsEachSource() throws {
+        let a = try SocketAddress(ipAddress: "2001:db8:1:2::1", port: 1)
+        let b = try SocketAddress(ipAddress: "2001:db8:1:2::ffff", port: 2)
+        let c = try SocketAddress(ipAddress: "2001:db8:1:3::1", port: 3)
+        #expect(AccessGateLimiter.source(of: a) == AccessGateLimiter.source(of: b))
+        #expect(AccessGateLimiter.source(of: a) != AccessGateLimiter.source(of: c))
+        #expect(AccessGateLimiter.source(of: try SocketAddress(ipAddress: "10.0.0.1", port: 1)) == "v4:10.0.0.1")
+
+        let limiter = AccessGateLimiter()
+        let channels = (0..<(AccessGateLimiter.maxPerSource + 2)).map { _ in EmbeddedChannel() }
+        for channel in channels {
+            try channel.connect(to: a).wait()
+            limiter.admit(channel)
+        }
+
+        #expect(limiter.count() == AccessGateLimiter.maxPerSource)
+        #expect(!channels[0].isActive)
+        #expect(!channels[1].isActive)
+        #expect(channels.last?.isActive == true)
+    }
+
+    /// A real connection to the host's listener counts against its own
+    /// address while it waits, and stops counting once it closes.
+    @Test func waitingConnectionCountsAgainstItsAddress() async throws {
+        let fixture = try await TunnelFixture.make()
+        let port = try #require(fixture.hostNode.listeningPort)
+        let limiter = fixture.hostNode.gateLimiter
+        let loopback = AccessGateLimiter.source(of: try SocketAddress(ipAddress: "127.0.0.1", port: 0))
+        let stream = try await TCPStream.connectToLoopback(port: port)
+        _ = try await challenge(from: stream)
+
+        #expect(limiter.count(from: loopback) == 1)
+        #expect(limiter.count(from: "unknown") == 0)
+
+        await stream.abort()
+        try await waitUntil { limiter.count() == 0 }
+        await fixture.clientNode.close()
+        await fixture.hostNode.close()
     }
 }

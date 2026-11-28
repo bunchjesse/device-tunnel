@@ -2,16 +2,39 @@ import Foundation
 import Network
 import Synchronization
 
-/// Finds hosts on the local network by the Bonjour service they advertise,
-/// and reports where each one — keyed by endpoint ID — can be reached now.
+/// One host advertisement found on the local network: where it can be
+/// reached, and the blinded tag that says which host it is to a device that
+/// knows the host's gate key.
+struct Advertisement: Sendable, Hashable {
+    /// Where the advertised listener can be reached.
+    let endpoint: NWEndpoint
+    /// The random salt the host chose for this advertisement.
+    let salt: Data
+    /// ``AccessGate/advertisementTag(gateKey:salt:)`` under the host's gate key.
+    let tag: Data
+
+    /// Whether the host whose gate key is `gateKey` published this.
+    func isAdvertised(byGateKey gateKey: Data) -> Bool {
+        AccessGate.matches(tag, AccessGate.advertisementTag(gateKey: gateKey, salt: salt))
+    }
+}
+
+/// Finds hosts on the local network by the Bonjour service they advertise.
+///
+/// Advertisements are blinded: a host advertises under a random instance
+/// name, with a fresh random salt and a tag over it keyed by its gate key,
+/// so only a device on the account can tell which host an advertisement
+/// belongs to (``Advertisement/isAdvertised(byGateKey:)``), and nobody else
+/// can follow a host from network to network.
 ///
 /// Discovery only supplies routes. Identity still rides on the host's key,
-/// which the SSH handshake checks against the registry, so an impostor
-/// advertising another host's endpoint ID fails to connect like any stale
-/// address does.
+/// which the access gate and SSH handshake check, so an impostor replaying
+/// another host's advertisement fails to connect like any stale address does.
 final class ServiceBrowser: Sendable {
-    /// The TXT record key a host's advertisement carries its endpoint ID in.
-    static let endpointIDKey = "id"
+    /// The TXT record key a host's advertisement carries its salt in.
+    static let saltKey = "s"
+    /// The TXT record key a host's advertisement carries its tag in.
+    static let tagKey = "t"
 
     private struct State {
         var browser: NWBrowser?
@@ -23,16 +46,16 @@ final class ServiceBrowser: Sendable {
     private static let queue = DispatchQueue(label: "dev.bunch.DeviceTunnel.discovery")
 
     private let serviceType: String
-    private let ownEndpointID: String
-    private let onChange: @Sendable ([String: [NWEndpoint]]) -> Void
+    private let ownGateKey: Data
+    private let onChange: @Sendable ([Advertisement]) -> Void
     private let state = Mutex(State())
 
-    /// Browses for `serviceType`, calling `onChange` with every host's
-    /// routes each time they change. Results for `ownEndpointID` are left
-    /// out. Call ``start()`` to begin.
-    init(serviceType: String, ownEndpointID: String, onChange: @escaping @Sendable ([String: [NWEndpoint]]) -> Void) {
+    /// Browses for `serviceType`, calling `onChange` with every
+    /// advertisement found each time they change. This device's own,
+    /// recognized by `ownGateKey`, is left out. Call ``start()`` to begin.
+    init(serviceType: String, ownGateKey: Data, onChange: @escaping @Sendable ([Advertisement]) -> Void) {
         self.serviceType = serviceType
-        self.ownEndpointID = ownEndpointID
+        self.ownGateKey = ownGateKey
         self.onChange = onChange
     }
 
@@ -48,14 +71,14 @@ final class ServiceBrowser: Sendable {
         guard !isCancelled else { return }
         previous?.cancel()
 
-        let ownEndpointID = ownEndpointID
+        let ownGateKey = ownGateKey
         let onChange = onChange
         browser.browseResultsChangedHandler = { results, _ in
             let found = results.compactMap { result -> (NWEndpoint, NWTXTRecord)? in
                 guard case .bonjour(let txt) = result.metadata else { return nil }
                 return (result.endpoint, txt)
             }
-            onChange(Self.routes(from: found, excluding: ownEndpointID))
+            onChange(Self.advertisements(from: found, excludingGateKey: ownGateKey))
         }
         browser.stateUpdateHandler = { [weak self, weak browser] state in
             guard let self, let browser else { return }
@@ -74,20 +97,18 @@ final class ServiceBrowser: Sendable {
         browser?.cancel()
     }
 
-    /// Every endpoint ID advertised in `results` and the endpoints it was
-    /// found at, leaving out `ownEndpointID` and advertisements without a
-    /// well-formed endpoint ID.
-    static func routes(from results: [(NWEndpoint, NWTXTRecord)], excluding ownEndpointID: String) -> [String: [NWEndpoint]] {
-        var routes: [String: [NWEndpoint]] = [:]
-        for (endpoint, txt) in results {
-            guard let endpointID = txt[endpointIDKey]?.lowercased(),
-                  endpointID != ownEndpointID,
-                  endpointID.count == 64,
-                  Data(hexEncoded: endpointID) != nil
-            else { continue }
-            routes[endpointID, default: []].append(endpoint)
+    /// Every well-formed advertisement in `results`, leaving out the ones
+    /// `ownGateKey` publishes.
+    static func advertisements(from results: [(NWEndpoint, NWTXTRecord)], excludingGateKey ownGateKey: Data) -> [Advertisement] {
+        results.compactMap { endpoint, txt in
+            guard let salt = txt[saltKey].flatMap({ Data(hexEncoded: $0) }),
+                  let tag = txt[tagKey].flatMap({ Data(hexEncoded: $0) }),
+                  salt.count == AccessGate.advertisementSaltLength,
+                  tag.count == AccessGate.advertisementTagLength
+            else { return nil }
+            let advertisement = Advertisement(endpoint: endpoint, salt: salt, tag: tag)
+            return advertisement.isAdvertised(byGateKey: ownGateKey) ? nil : advertisement
         }
-        return routes
     }
 
     private func handle(_ newState: NWBrowser.State, of browser: NWBrowser) {
@@ -118,9 +139,20 @@ final class ServiceBrowser: Sendable {
 }
 
 extension NWListener.Service {
-    /// The advertisement a host publishes for clients to find it by:
-    /// `serviceType`, under the Mac's own name, with its endpoint ID.
-    static func tunnel(serviceType: String, endpointID: String) -> NWListener.Service {
-        NWListener.Service(type: serviceType, txtRecord: NWTXTRecord([ServiceBrowser.endpointIDKey: endpointID]))
+    /// A fresh blinded advertisement for the host whose gate key is
+    /// `gateKey`: a random instance name instead of the device's own, and a
+    /// new random salt with its tag. A host publishes a new one whenever its
+    /// network changes, so nothing in one advertisement names the next; the
+    /// listener's port, which a host keeps when it can, still may.
+    static func tunnel(serviceType: String, gateKey: Data) -> NWListener.Service {
+        let salt = AccessGate.randomBytes(AccessGate.advertisementSaltLength)
+        return NWListener.Service(
+            name: AccessGate.randomBytes(AccessGate.advertisementNameLength).hexEncoded,
+            type: serviceType,
+            txtRecord: NWTXTRecord([
+                ServiceBrowser.saltKey: salt.hexEncoded,
+                ServiceBrowser.tagKey: AccessGate.advertisementTag(gateKey: gateKey, salt: salt).hexEncoded,
+            ])
+        )
     }
 }

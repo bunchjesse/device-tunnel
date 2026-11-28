@@ -15,8 +15,9 @@ import Synchronization
 /// Ed25519 key is its SSH key, so both ends are authenticated by the keys the
 /// registry lists and everything is encrypted end to end.
 ///
-/// A host listens for direct TCP connections on every interface and
-/// advertises the listener over Bonjour. A client dials every route it
+/// A host listens for direct TCP connections on every interface, puts the
+/// ``AccessGate`` in front of SSH on each, and advertises the listener over
+/// Bonjour under a blinded name and tag. A client dials every route it
 /// knows at once: the Bonjour advertisements it found on the local network,
 /// and the addresses the host's registry record publishes, which include
 /// the DNS names of the host's addresses so name-based network policy, such
@@ -53,6 +54,8 @@ public final class RemoteNode: Sendable {
     private let registry: DeviceRegistry?
     /// Fixed direct address to publish instead of the interfaces' addresses.
     private let publishedHost: String?
+    /// Bounds the direct connections waiting at the access gate.
+    let gateLimiter: AccessGateLimiter
     /// Runs ``HostNames`` lookups one at a time, off the cooperative thread
     /// pool, since they block on DNS.
     private let hostNameQueue = DispatchQueue(label: "dev.bunch.DeviceTunnel.hostnames")
@@ -60,6 +63,9 @@ public final class RemoteNode: Sendable {
 
     private struct State {
         var listener: (any Channel)?
+        /// The Network framework listener under `listener`, whose Bonjour
+        /// advertisement is renewed on every network change.
+        var advertiser: NWListener?
         var listeningPort: UInt16?
         var directAddresses: [String] = []
         /// The confirmed DNS names of this host's addresses, by address
@@ -68,6 +74,12 @@ public final class RemoteNode: Sendable {
         /// Bumped on every address refresh, so only the newest refresh's
         /// name lookup is published.
         var addressGeneration = 0
+        /// Every host advertisement discovery currently sees.
+        var advertisements: [Advertisement] = []
+        /// The gate keys of the hosts this node has dialed, by endpoint ID,
+        /// for telling which advertisements are theirs.
+        var knownHosts: [String: Data] = [:]
+        /// The advertised routes of each known host.
         var discoveredRoutes: [String: [NWEndpoint]] = [:]
         var networkMonitor: NetworkChangeMonitor?
         var browser: ServiceBrowser?
@@ -90,7 +102,8 @@ public final class RemoteNode: Sendable {
         var isClosed = false
     }
 
-    /// How long establishing one path may take, SSH handshake included.
+    /// How long establishing one path may take, access gate and SSH
+    /// handshake included.
     static let attemptTimeout: Duration = .seconds(15)
     /// Most connections waiting for the host service to take them.
     static let maxQueuedConnections = 64
@@ -109,8 +122,9 @@ public final class RemoteNode: Sendable {
         signingKey: Curve25519.Signing.PrivateKey,
         incoming: AsyncInbox<SSHIncomingTunnel>,
         registry: DeviceRegistry?,
-        listener: (channel: any Channel, port: UInt16)?,
-        publishedHost: String?
+        listener: BoundListener?,
+        publishedHost: String?,
+        gateLimiter: AccessGateLimiter
     ) {
         self.identity = identity
         self.configuration = configuration
@@ -119,12 +133,13 @@ public final class RemoteNode: Sendable {
         self.incoming = incoming
         self.registry = registry
         self.publishedHost = publishedHost
-        self.state = Mutex(State(listener: listener?.channel, listeningPort: listener?.port))
+        self.gateLimiter = gateLimiter
+        self.state = Mutex(State(listener: listener?.channel, advertiser: listener?.advertiser, listeningPort: listener?.port))
 
         let monitor = NetworkChangeMonitor { [weak self] in self?.networkPathChanged() }
         let browser = configuration.serviceType.map { serviceType in
-            ServiceBrowser(serviceType: serviceType, ownEndpointID: identity.endpointID) { [weak self] routes in
-                self?.discovered(routes)
+            ServiceBrowser(serviceType: serviceType, ownGateKey: identity.gateKey) { [weak self] advertisements in
+                self?.discovered(advertisements)
             }
         }
         state.withLock { state in
@@ -158,17 +173,16 @@ public final class RemoteNode: Sendable {
         let sshKey = try SSHKeys.privateKey(for: identity)
         let signingKey = try Curve25519.Signing.PrivateKey(rawRepresentation: identity.secretKey)
         let incoming = AsyncInbox<SSHIncomingTunnel>()
+        let gateLimiter = AccessGateLimiter()
         guard let registry else {
-            return RemoteNode(identity: identity, configuration: configuration, sshKey: sshKey, signingKey: signingKey, incoming: incoming, registry: nil, listener: nil, publishedHost: nil)
+            return RemoteNode(identity: identity, configuration: configuration, sshKey: sshKey, signingKey: signingKey, incoming: incoming, registry: nil, listener: nil, publishedHost: nil, gateLimiter: gateLimiter)
         }
         let listener = try await listen(
             preferredPort: preferredPort,
-            host: listenHost,
-            sshKey: sshKey,
-            configuration: configuration,
-            endpointID: identity.endpointID,
-            admits: admission(by: registry),
-            incoming: incoming
+            listenHost: listenHost,
+            setup: HostSetup(sshKey: sshKey, gateKey: identity.gateKey, username: configuration.protocolName, admits: admission(by: registry), incoming: incoming),
+            serviceType: configuration.serviceType,
+            gateLimiter: gateLimiter
         )
         return RemoteNode(
             identity: identity,
@@ -178,7 +192,8 @@ public final class RemoteNode: Sendable {
             incoming: incoming,
             registry: registry,
             listener: listener,
-            publishedHost: listenHost
+            publishedHost: listenHost,
+            gateLimiter: gateLimiter
         )
     }
 
@@ -222,7 +237,9 @@ public final class RemoteNode: Sendable {
     }
 
     /// Calls `handler` with the endpoint IDs of hosts whose routes on the
-    /// local network appeared or changed, until the node closes.
+    /// local network appeared or changed, until the node closes. Only hosts
+    /// this node has dialed are recognized, since an advertisement names a
+    /// host only to a device that knows its gate key.
     public func onRoutesChange(_ handler: @escaping @Sendable (Set<String>) -> Void) {
         state.withLock { state in
             guard !state.isClosed else { return }
@@ -300,20 +317,26 @@ public final class RemoteNode: Sendable {
         state.withLock { $0.dialsThroughRelays = enabled }
     }
 
-    /// A registration with `relay` whose sessions run this host's SSH server.
+    /// A registration with `relay` whose sessions run this host's access
+    /// gate and then its SSH server.
     private func makeRelayRegistration(with relay: RelayAddress, registry: DeviceRegistry, generation: Int) -> RelayHost {
         let signingKey = signingKey
-        let sshKey = sshKey
-        let username = configuration.protocolName
-        let incoming = incoming
-        let admits = Self.admission(by: registry)
+        let setup = HostSetup(
+            sshKey: sshKey,
+            gateKey: identity.gateKey,
+            username: configuration.protocolName,
+            admits: Self.admission(by: registry),
+            incoming: incoming
+        )
         return RelayHost(
             namespace: configuration.relayNamespace,
             endpointID: identity.endpointID,
             sign: { try signingKey.signature(for: $0) },
             dial: { try await Self.openRelayConnection(to: relay) },
             acceptSession: { channel in
-                try Self.serveIncoming(channel, path: .relay, hostKey: sshKey, username: username, admits: admits, into: incoming)
+                // The relay already bounds a host's pending sessions, and
+                // they all share its address, so no limiter here.
+                try Self.gate(channel, path: .relay, setup: setup, limiter: nil)
             },
             onStatusChange: { [weak self] status in
                 self?.relayStatusChanged(to: RelayStatus(status), generation: generation)
@@ -370,59 +393,116 @@ public final class RemoteNode: Sendable {
     }
 
     private func networkPathChanged() {
+        renewAdvertisement()
         refreshDirectAddresses()
         let observers = state.withLock { $0.isClosed ? [] : $0.networkObservers }
         observers.forEach { $0() }
     }
 
-    /// Adopts the routes discovery found, reporting the hosts whose routes
-    /// appeared or changed. Hosts that vanished go quietly: their links
-    /// keep whatever tunnel they have.
-    func discovered(_ routes: [String: [NWEndpoint]]) {
+    /// Advertises under a fresh random name and salt, so the advertisement
+    /// on this network can't be linked to the one on the last.
+    private func renewAdvertisement() {
+        guard let serviceType = configuration.serviceType else { return }
+        let advertiser = state.withLock { $0.isClosed ? nil : $0.advertiser }
+        advertiser?.service = .tunnel(serviceType: serviceType, gateKey: identity.gateKey)
+    }
+
+    /// Adopts the advertisements discovery found, reporting the known hosts
+    /// whose routes appeared or changed. Hosts that vanished go quietly:
+    /// their links keep whatever tunnel they have.
+    func discovered(_ advertisements: [Advertisement]) {
         let (observers, changed) = state.withLock { state -> ([@Sendable (Set<String>) -> Void], Set<String>) in
             guard !state.isClosed else { return ([], []) }
-            let changed = Set(routes.filter { state.discoveredRoutes[$0.key] != $0.value }.keys)
-            state.discoveredRoutes = routes
-            return (state.routeObservers, changed)
+            state.advertisements = advertisements
+            return (state.routeObservers, Self.matchRoutes(in: &state))
         }
         guard !changed.isEmpty else { return }
         RemoteLog.discovery.info("Found \(changed.count) host(s) on the local network")
         observers.forEach { $0(changed) }
     }
 
+    /// Learns the gate key of `host`, so discovery can recognize its
+    /// advertisements. Every dial does this; a host's routes are reported
+    /// only once something has dialed it.
+    func remember(host: DeviceRecord) {
+        guard let gateKey = host.gateKey else { return }
+        state.withLock { state in
+            guard state.knownHosts[host.endpointID] != gateKey else { return }
+            state.knownHosts[host.endpointID] = gateKey
+            _ = Self.matchRoutes(in: &state)
+        }
+    }
+
+    /// Recomputes each known host's advertised routes, returning the hosts
+    /// whose routes appeared or changed.
+    private static func matchRoutes(in state: inout State) -> Set<String> {
+        var routes: [String: [NWEndpoint]] = [:]
+        for (endpointID, gateKey) in state.knownHosts {
+            let endpoints = state.advertisements.filter { $0.isAdvertised(byGateKey: gateKey) }.map(\.endpoint)
+            if !endpoints.isEmpty {
+                routes[endpointID] = endpoints
+            }
+        }
+        let changed = Set(routes.filter { state.discoveredRoutes[$0.key] != $0.value }.keys)
+        state.discoveredRoutes = routes
+        return changed
+    }
+
     // MARK: - Host side
 
-    /// Admits the keys `registry` lists. A Keychain failure admits the key
-    /// too, so the host service can report the failure on the control
-    /// stream instead of claiming it doesn't know the device.
+    /// What a host needs to gate and serve an incoming connection.
+    private struct HostSetup: Sendable {
+        let sshKey: NIOSSHPrivateKey
+        let gateKey: Data
+        let username: String
+        let admits: @Sendable (String) -> Bool
+        let incoming: AsyncInbox<SSHIncomingTunnel>
+    }
+
+    /// A listener bound for direct connections.
+    private struct BoundListener {
+        let channel: any Channel
+        let advertiser: NWListener
+        let port: UInt16
+    }
+
+    /// Admits the keys `registry` knows, revoked ones included so the host
+    /// service can turn them away with a reason. Fails closed: a Keychain
+    /// failure admits nothing, so no key the registry doesn't list ever
+    /// holds an authenticated session.
     private static func admission(by registry: DeviceRegistry) -> @Sendable (String) -> Bool {
         { endpointID in
             do {
-                return try registry.record(for: endpointID) != nil
+                return try registry.knows(endpointID: endpointID)
             } catch {
-                return true
+                RemoteLog.host.error("Keychain read failed while admitting a device: \(error.localizedDescription, privacy: .public)")
+                return false
             }
         }
     }
 
-    /// Runs this host's SSH server on `channel`, a device's connection
-    /// arriving over `path`, and queues it on `incoming`. Throws, so the
-    /// connection is dropped, once ``maxQueuedConnections`` are waiting or
-    /// the node has closed. Must run on the channel's event loop.
-    private static func serveIncoming(
-        _ channel: any Channel,
-        path: ConnectionPath,
-        hostKey: NIOSSHPrivateKey,
-        username: String,
-        admits: @escaping @Sendable (String) -> Bool,
-        into incoming: AsyncInbox<SSHIncomingTunnel>
-    ) throws {
-        guard incoming.count < maxQueuedConnections else {
+    /// Puts the access gate in front of `channel`, a connection arriving
+    /// over `path`; once the peer passes it, runs this host's SSH server and
+    /// queues the connection on `incoming`. Must run on the channel's event
+    /// loop.
+    private static func gate(_ channel: any Channel, path: ConnectionPath, setup: HostSetup, limiter: AccessGateLimiter?) throws {
+        let gate = AccessGateServerHandler(gateKey: setup.gateKey, limiter: limiter) { channel in
+            try serveIncoming(channel, path: path, setup: setup)
+        }
+        try channel.pipeline.syncOperations.addHandler(gate)
+    }
+
+    /// Runs this host's SSH server on `channel`, which passed the access
+    /// gate, and queues it on `incoming`. Throws, so the connection is
+    /// dropped, once ``maxQueuedConnections`` are waiting or the node has
+    /// closed. Must run on the channel's event loop.
+    private static func serveIncoming(_ channel: any Channel, path: ConnectionPath, setup: HostSetup) throws {
+        guard setup.incoming.count < maxQueuedConnections else {
             throw RemoteAccessError.localSocketFailed("too many pending connections")
         }
         let streams = AsyncInbox<ChannelByteStream>()
-        let authenticated = try SSHPipeline.addServer(to: channel, hostKey: hostKey, username: username, admits: admits, streams: streams)
-        guard incoming.push(SSHIncomingTunnel(channel: channel, authenticated: authenticated, incoming: streams, path: path)) else {
+        let authenticated = try SSHPipeline.addServer(to: channel, hostKey: setup.sshKey, username: setup.username, admits: setup.admits, streams: streams)
+        guard setup.incoming.push(SSHIncomingTunnel(channel: channel, authenticated: authenticated, incoming: streams, path: path)) else {
             throw RemoteAccessError.localSocketFailed("endpoint closed")
         }
     }
@@ -430,16 +510,13 @@ public final class RemoteNode: Sendable {
     private static func listen(
         preferredPort: UInt16?,
         fallingBackToAnyPort: Bool = true,
-        host: String?,
-        sshKey: NIOSSHPrivateKey,
-        configuration: RemoteAccessConfiguration,
-        endpointID: String,
-        admits: @escaping @Sendable (String) -> Bool,
-        incoming: AsyncInbox<SSHIncomingTunnel>
-    ) async throws -> (channel: any Channel, port: UInt16) {
+        listenHost host: String?,
+        setup: HostSetup,
+        serviceType: String?,
+        gateLimiter: AccessGateLimiter
+    ) async throws -> BoundListener {
         let preferred = preferredPort.flatMap(NWEndpoint.Port.init(rawValue:))
         let ports = [preferred, fallingBackToAnyPort || preferred == nil ? NWEndpoint.Port.any : nil].compactMap { $0 }
-        let username = configuration.protocolName
         var lastError: (any Error)?
         for port in ports {
             let parameters = NWParameters(tls: nil, tcp: TunnelSocket.tcpOptions)
@@ -457,13 +534,13 @@ public final class RemoteNode: Sendable {
             }
             do {
                 let nwListener = host == nil ? try NWListener(using: parameters, on: port) : try NWListener(using: parameters)
-                nwListener.service = configuration.serviceType.map { .tunnel(serviceType: $0, endpointID: endpointID) }
+                nwListener.service = serviceType.map { .tunnel(serviceType: $0, gateKey: setup.gateKey) }
                 // One loop: with an existing NWListener, NIOTS picks the
                 // listener's loop twice from the group and asserts they match.
                 let channel = try await NIOTSListenerBootstrap(group: NIOTSEventLoopGroup.singleton.next())
                     .childChannelInitializer { child in
                         child.eventLoop.makeCompletedFuture {
-                            try serveIncoming(child, path: .direct, hostKey: sshKey, username: username, admits: admits, into: incoming)
+                            try gate(child, path: .direct, setup: setup, limiter: gateLimiter)
                         }
                     }
                     .withNWListener(nwListener)
@@ -472,7 +549,7 @@ public final class RemoteNode: Sendable {
                     try? await channel.close().get()
                     throw RemoteAccessError.localSocketFailed("listener has no port")
                 }
-                return (channel, bound)
+                return BoundListener(channel: channel, advertiser: nwListener, port: bound)
             } catch {
                 lastError = error
             }
@@ -570,16 +647,21 @@ public final class RemoteNode: Sendable {
                 let bound = try await Self.listen(
                     preferredPort: preferredPort,
                     fallingBackToAnyPort: attempt > Self.samePortAttempts,
-                    host: publishedHost,
-                    sshKey: sshKey,
-                    configuration: configuration,
-                    endpointID: identity.endpointID,
-                    admits: Self.admission(by: registry),
-                    incoming: incoming
+                    listenHost: publishedHost,
+                    setup: HostSetup(
+                        sshKey: sshKey,
+                        gateKey: identity.gateKey,
+                        username: configuration.protocolName,
+                        admits: Self.admission(by: registry),
+                        incoming: incoming
+                    ),
+                    serviceType: configuration.serviceType,
+                    gateLimiter: gateLimiter
                 )
                 let adopted = state.withLock { state -> Bool in
                     guard !state.isClosed else { return false }
                     state.listener = bound.channel
+                    state.advertiser = bound.advertiser
                     state.listeningPort = bound.port
                     return true
                 }
@@ -601,10 +683,11 @@ public final class RemoteNode: Sendable {
 
     // MARK: - Client side
 
-    /// Dials one route to a host: TCP, then SSH, trusting only the host key
-    /// `hostEndpointID` names. A route that has to wait for connectivity
-    /// fails at once with the reason ``PathWatcher`` recorded.
-    private func dial(_ endpoint: NWEndpoint, hostEndpointID: String) async throws -> SSHTunnelConnection {
+    /// Dials one route to a host: TCP, the access gate, then SSH, trusting
+    /// only the host key `host`'s endpoint ID names. A route that has to
+    /// wait for connectivity fails at once with the reason ``PathWatcher``
+    /// recorded.
+    private func dial(_ endpoint: NWEndpoint, host: GatedHost) async throws -> SSHTunnelConnection {
         let sshKey = sshKey
         let username = configuration.protocolName
         let diagnosis = DialDiagnosis()
@@ -617,20 +700,20 @@ public final class RemoteNode: Sendable {
                         try channel.pipeline.syncOperations.addHandler(PathWatcher(diagnosis: diagnosis))
                         return Dialed(
                             channel: channel,
-                            authenticated: try SSHPipeline.addClient(to: channel, key: sshKey, hostEndpointID: hostEndpointID, username: username)
+                            authenticated: try Self.answerGate(on: channel, host: host, key: sshKey, username: username)
                         )
                     }
                 }
-            return try await dialed.connection(hostEndpointID: hostEndpointID, path: .direct)
+            return try await dialed.connection(hostEndpointID: host.endpointID, path: .direct)
         } catch {
             throw diagnosis.error ?? error
         }
     }
 
     /// Dials a host through `relay`: TCP to the relay, which joins the
-    /// connection to the host, then SSH end to end, trusting only the host
-    /// key `hostEndpointID` names.
-    private func dialRelay(_ relay: RelayAddress, hostEndpointID: String) async throws -> SSHTunnelConnection {
+    /// connection to the host, then the access gate and SSH end to end,
+    /// trusting only the host key `host`'s endpoint ID names.
+    private func dialRelay(_ relay: RelayAddress, host: GatedHost) async throws -> SSHTunnelConnection {
         let sshKey = sshKey
         let username = configuration.protocolName
         let namespace = configuration.relayNamespace
@@ -642,8 +725,8 @@ public final class RemoteNode: Sendable {
                 .connect(host: relay.host, port: relay.port) { channel in
                     channel.eventLoop.makeCompletedFuture {
                         try channel.pipeline.syncOperations.addHandler(PathWatcher(diagnosis: diagnosis))
-                        let joined = try RelayClient.connect(on: channel, namespace: namespace, endpointID: hostEndpointID) { channel in
-                            try SSHPipeline.addClient(to: channel, key: sshKey, hostEndpointID: hostEndpointID, username: username)
+                        let joined = try RelayClient.connect(on: channel, namespace: namespace, endpointID: host.endpointID) { channel in
+                            try Self.answerGate(on: channel, host: host, key: sshKey, username: username)
                         }
                         return (channel as any Channel, joined)
                     }
@@ -653,10 +736,23 @@ public final class RemoteNode: Sendable {
             } onCancel: {
                 channel.close(promise: nil)
             }
-            return try await Dialed(channel: channel, authenticated: authenticated).connection(hostEndpointID: hostEndpointID, path: .relay)
+            return try await Dialed(channel: channel, authenticated: authenticated).connection(hostEndpointID: host.endpointID, path: .relay)
         } catch {
             throw diagnosis.error ?? Self.relayFailure(error)
         }
+    }
+
+    /// Adds the client's end of the access gate to `channel`, which starts
+    /// SSH once the host has proven it knows `host`'s gate key. The future
+    /// succeeds once both sides are authenticated. Must be called on the
+    /// channel's event loop.
+    private static func answerGate(on channel: any Channel, host: GatedHost, key: NIOSSHPrivateKey, username: String) throws -> EventLoopFuture<Void> {
+        let passed = channel.eventLoop.makePromise(of: Void.self)
+        let gate = AccessGateClientHandler(gateKey: host.gateKey, promise: passed) { channel in
+            try SSHPipeline.addClient(to: channel, key: key, hostEndpointID: host.endpointID, username: username)
+        }
+        try channel.pipeline.syncOperations.addHandler(gate)
+        return passed.futureResult
     }
 
     /// The tunnel's own error for a relay client failure.
@@ -693,13 +789,16 @@ extension RemoteNode: TunnelTransport {
     /// Dials every direct route to the host at once — the ones found on the
     /// local network first, then the registry's — plus, when allowed, the
     /// host's relay after ``relayHeadStart``, and keeps the first to finish
-    /// the SSH handshake.
+    /// the SSH handshake. A host whose record has no gate key runs a build
+    /// too old to reach.
     func connect(to record: DeviceRecord, allowingRelay: Bool) async throws -> any TunnelConnection {
-        let hostEndpointID = record.endpointID
-        let (discovered, usesRelays) = state.withLock { ($0.discoveredRoutes[hostEndpointID] ?? [], $0.dialsThroughRelays) }
+        guard let gateKey = record.gateKey else { throw RemoteAccessError.outdatedPeer }
+        let host = GatedHost(endpointID: record.endpointID, gateKey: gateKey)
+        remember(host: record)
+        let (discovered, usesRelays) = state.withLock { ($0.discoveredRoutes[host.endpointID] ?? [], $0.dialsThroughRelays) }
         let endpoints = discovered + record.directAddresses.compactMap { HostPort(parsing: $0)?.endpoint }
         var attempts: [@Sendable () async throws -> SSHTunnelConnection] = endpoints.map { endpoint in
-            { try await self.dial(endpoint, hostEndpointID: hostEndpointID) }
+            { try await self.dial(endpoint, host: host) }
         }
         if allowingRelay, usesRelays, let relay = record.relayAddress.flatMap({ RelayAddress(parsing: $0) }) {
             let waitsForDirect = !attempts.isEmpty
@@ -707,7 +806,7 @@ extension RemoteNode: TunnelTransport {
                 if waitsForDirect {
                     try await Task.sleep(for: Self.relayHeadStart)
                 }
-                return try await self.dialRelay(relay, hostEndpointID: hostEndpointID)
+                return try await self.dialRelay(relay, host: host)
             }
         }
         guard !attempts.isEmpty else { throw RemoteAccessError.noRoute }
@@ -721,7 +820,15 @@ extension RemoteNode: TunnelTransport {
     }
 }
 
-/// A TCP connection with the client side of SSH installed.
+/// The host a dial is for: the key SSH must find, and the gate key it must
+/// prove it knows first.
+private struct GatedHost: Sendable {
+    let endpointID: String
+    let gateKey: Data
+}
+
+/// A TCP connection with the client's access gate installed, which sets up
+/// the client side of SSH once the host passes it.
 private struct Dialed: Sendable {
     let channel: any Channel
     let authenticated: EventLoopFuture<Void>

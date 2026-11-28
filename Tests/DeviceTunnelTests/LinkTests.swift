@@ -2,19 +2,87 @@ import Foundation
 import Testing
 @testable import DeviceTunnel
 
-/// A link's reactions to what changes around it, driven through a
+/// A link's reactions to what changes around it, mostly driven through a
 /// scripted transport so every dial happens exactly when the test says.
 @Suite(.timeLimit(.minutes(1)))
 struct LinkTests {
     private let oldHost = makeRecord(endpointID: "host", canHost: true, directAddresses: ["10.0.0.2:4000"])
     private let newHost = makeRecord(endpointID: "host", canHost: true, directAddresses: ["10.0.0.3:4000"])
 
-    private func startLink(_ transport: ScriptedTransport, recorder: StateRecorder = StateRecorder()) async -> RemoteHostLink {
-        let link = RemoteHostLink(transport: transport, host: oldHost) { state in
+    private func startLink(_ transport: ScriptedTransport, recorder: StateRecorder = StateRecorder()) async throws -> RemoteHostLink {
+        let link = RemoteHostLink(transport: transport, host: oldHost, trustedHosts: try trusting(oldHost)) { state in
             await recorder.record(state)
         }
         await link.start()
         return link
+    }
+
+    /// A host this device's user hasn't trusted is never dialed: the link
+    /// stops and shows the host's fingerprint to compare. Once the user
+    /// trusts it, reconnecting dials it.
+    @Test func untrustedHostIsNeverDialed() async throws {
+        let recorder = StateRecorder()
+        let transport = ScriptedTransport { _ in ReplyingConnection(reply: .approved(token: "t", hostName: "Studio")) }
+        let trustedHosts = TrustedHosts(store: InMemoryKeychainStore(), configuration: makeConfiguration())
+        let link = RemoteHostLink(transport: transport, host: oldHost, trustedHosts: trustedHosts) { await recorder.record($0) }
+        await link.start()
+
+        let state = try await withTimeout(.seconds(3)) { await recorder.first { if case .untrustedHost = $0 { true } else { false } } }
+        #expect(state == .untrustedHost(hostName: oldHost.name, fingerprint: oldHost.fingerprint))
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(await transport.dials.records.isEmpty)
+
+        try trustedHosts.trust(oldHost)
+        await link.reconnect()
+        _ = try await withTimeout(.seconds(3)) { await recorder.first { $0.connectedPort != nil } }
+        #expect(await transport.dials.records.count == 1)
+        await link.stop()
+    }
+
+    /// A host this device distrusted — by hand, or because it was revoked
+    /// on the account — is never dialed either.
+    @Test func distrustedHostIsNeverDialed() async throws {
+        let recorder = StateRecorder()
+        let transport = ScriptedTransport { _ in ReplyingConnection(reply: .approved(token: "t", hostName: "Studio")) }
+        let trustedHosts = try trusting(oldHost)
+        try trustedHosts.applyRevocations([DeviceRevocation(endpointID: oldHost.endpointID, deviceName: oldHost.name)])
+        let link = RemoteHostLink(transport: transport, host: oldHost, trustedHosts: trustedHosts) { await recorder.record($0) }
+        await link.start()
+
+        _ = try await withTimeout(.seconds(3)) { await recorder.first { if case .untrustedHost = $0 { true } else { false } } }
+        #expect(await transport.dials.records.isEmpty)
+        await link.stop()
+    }
+
+    /// A trust store the link can't read dials nothing, but isn't mistaken
+    /// for the user not trusting the host: the link says so and retries
+    /// rather than asking the user to trust the host again.
+    @Test func unreadableTrustStoreRetriesWithoutDialing() async throws {
+        let recorder = StateRecorder()
+        let transport = ScriptedTransport { _ in ReplyingConnection(reply: .approved(token: "t", hostName: "Studio")) }
+        let trustedHosts = TrustedHosts(store: UnreadableKeychainStore(), configuration: makeConfiguration())
+        let link = RemoteHostLink(transport: transport, host: oldHost, trustedHosts: trustedHosts) { await recorder.record($0) }
+        await link.start()
+
+        _ = try await withTimeout(.seconds(3)) { await recorder.first { if case .unavailable = $0 { true } else { false } } }
+        #expect(await recorder.states.contains { if case .untrustedHost = $0 { true } else { false } } == false)
+        #expect(await transport.dials.records.isEmpty)
+        await link.stop()
+    }
+
+    /// A host whose record has no gate key runs a build too old to reach,
+    /// and the link says to update rather than that the host is offline.
+    @Test func hostWithoutAGateKeyNeedsAnUpdate() async throws {
+        let recorder = StateRecorder()
+        let fixture = try await TunnelFixture.make()
+        let outdated = makeRecord(endpointID: fixture.hostRecord.endpointID, gateKey: nil, canHost: true, directAddresses: fixture.hostRecord.directAddresses)
+        let link = RemoteHostLink(node: fixture.clientNode, host: outdated, trustedHosts: try trusting(outdated)) { await recorder.record($0) }
+        await link.start()
+
+        _ = try await withTimeout(.seconds(3)) { await recorder.first { $0 == .unavailable(reason: RemoteHostLink.updateBothDevices) } }
+        await link.stop()
+        await fixture.clientNode.close()
+        await fixture.hostNode.close()
     }
 
     /// A registry update with new addresses that lands while a dial to the
@@ -25,7 +93,7 @@ struct LinkTests {
             try await Task.sleep(for: .seconds(30))
             throw RemoteAccessError.timedOut
         }
-        let link = await startLink(transport)
+        let link = try await startLink(transport)
         await transport.dials.waitForDials(1)
 
         link.update(host: newHost)
@@ -39,7 +107,7 @@ struct LinkTests {
     /// record, however their delivery is scheduled.
     @Test func latestUpdateWins() async throws {
         let transport = ScriptedTransport { _ in throw RemoteAccessError.notRecognized }
-        let link = await startLink(transport)
+        let link = try await startLink(transport)
         await transport.dials.waitForDials(1)
 
         link.update(host: makeRecord(endpointID: "host", canHost: true, directAddresses: ["10.0.0.9:4000"]))
@@ -54,7 +122,7 @@ struct LinkTests {
     /// A network change while the link waits out a retry redials right away.
     @Test func networkChangeWhileWaitingRedialsRightAway() async throws {
         let transport = ScriptedTransport { _ in ReplyingConnection(reply: .unknownDevice) }
-        let link = await startLink(transport)
+        let link = try await startLink(transport)
         await transport.dials.waitForDials(1)
         try await Task.sleep(for: .milliseconds(100))
 
@@ -72,7 +140,7 @@ struct LinkTests {
             await gate.wait()
             return ReplyingConnection(reply: .unknownDevice)
         }
-        let link = await startLink(transport)
+        let link = try await startLink(transport)
         await transport.dials.waitForDials(1)
 
         await link.networkChanged()
@@ -95,7 +163,7 @@ struct LinkTests {
             if turnedAwayDuringAuthentication { throw RemoteAccessError.notRecognized }
             return ReplyingConnection(reply: .unknownDevice)
         }
-        let link = await startLink(transport, recorder: recorder)
+        let link = try await startLink(transport, recorder: recorder)
 
         _ = try await withTimeout(.seconds(3)) { await recorder.first { $0 == .notRecognized } }
         await link.stop()
@@ -106,7 +174,7 @@ struct LinkTests {
     @Test func localNetworkDenialIsReported() async throws {
         let recorder = StateRecorder()
         let transport = ScriptedTransport { _ in throw RemoteAccessError.localNetworkDenied }
-        let link = await startLink(transport, recorder: recorder)
+        let link = try await startLink(transport, recorder: recorder)
 
         _ = try await withTimeout(.seconds(3)) { await recorder.first { $0 == .localNetworkDenied } }
         await link.stop()
@@ -122,7 +190,7 @@ struct LinkTests {
             await gate.wait()
             return connection
         }
-        let link = await startLink(transport, recorder: recorder)
+        let link = try await startLink(transport, recorder: recorder)
         await transport.dials.waitForDials(1)
 
         await link.stop()
@@ -149,7 +217,7 @@ struct LinkTests {
             if directDials.value == 1 { throw RemoteAccessError.timedOut }
             return direct
         })
-        let link = await startLink(transport, recorder: recorder)
+        let link = try await startLink(transport, recorder: recorder)
         let first = try await withTimeout(.seconds(3)) { await recorder.first { $0.connectedPath == .relay } }
         await transport.dials.waitForDials(2)
         try await waitUntil { directDials.value == 1 }
@@ -171,7 +239,7 @@ struct LinkTests {
     @Test func directTunnelDoesNotProbe() async throws {
         let recorder = StateRecorder()
         let transport = ScriptedTransport { _ in ReplyingConnection(reply: .approved(token: "t", hostName: "Studio")) }
-        let link = await startLink(transport, recorder: recorder)
+        let link = try await startLink(transport, recorder: recorder)
         _ = try await withTimeout(.seconds(3)) { await recorder.first { $0.connectedPath == .direct } }
 
         await link.networkChanged()
@@ -194,7 +262,7 @@ struct LinkTests {
             }
             return relayed
         })
-        let link = await startLink(transport, recorder: recorder)
+        let link = try await startLink(transport, recorder: recorder)
         _ = try await withTimeout(.seconds(3)) { await recorder.first { $0.connectedPath == .relay } }
         await transport.dials.waitForDials(2)
 
